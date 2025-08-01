@@ -634,6 +634,7 @@ multimodal_model_archs = [
     "InternVLChatModel",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
+    "VideoMllamaForConditionalGeneration"
 ]
 
 
@@ -660,7 +661,7 @@ def is_audio_model(model_architectures: List[str]):
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+    return "MllamaForConditionalGeneration" in model_architectures or "VideoMllamaForConditionalGeneration" in model_architectures
 
 
 def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
@@ -670,6 +671,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "Grok1AForCausalLM",
         "LlavaLlamaForCausalLM",
         "MllamaForConditionalGeneration",
+        "VideoMllamaForConditionalGeneration",
         "CLIPModel",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):

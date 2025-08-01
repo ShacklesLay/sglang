@@ -275,11 +275,18 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
 
+    # For custom mask
+    custom_mask: Optional[torch.Tensor] = None
+    
+    # For vision position ids (used in video mllama)
+    vision_position_ids: Optional[torch.Tensor] = None
+
     @classmethod
     def init_new(
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
+        tokenizer=None,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
@@ -316,6 +323,9 @@ class ForwardBatch:
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
         device = model_runner.device
+        # Compute custom cross attention mask and vision position ids if needed
+        if getattr(model_runner.server_args, 'enable_custom_cross_attention', False) and ret.forward_mode.is_extend():
+            ret.custom_mask, ret.vision_position_ids = ret._compute_custom_cross_attention_mask(model_runner, batch, tokenizer)
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -413,6 +423,245 @@ class ForwardBatch:
         )
 
         return ret
+
+    def _compute_custom_cross_attention_mask(self, model_runner: "ModelRunner", batch: "ModelWorkerBatch", tokenizer=None):
+        """
+        Compute custom cross attention mask and vision position ids for the batch if needed.
+        This follows the VideoMllama implementation.
+        """
+        try:
+            import numpy as np
+            import torch
+            
+            # If no tokenizer provided, skip custom mask computation
+            if tokenizer is None:
+                return None, None
+            
+            # Get image and video token ids
+            if not hasattr(tokenizer, "image_token"):
+                image_token = "<|image|>"
+                image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+            else:
+                image_token_id = tokenizer.image_token_id
+
+            if not hasattr(tokenizer, "video_token"):
+                video_token = "<|video|>"
+                video_token_id = tokenizer.convert_tokens_to_ids(video_token)
+            else:
+                video_token_id = tokenizer.video_token_id
+            
+            cross_attention_token_masks = []
+            vision_position_ids_batch = []
+            
+            # Extract input_ids from each request in the batch
+            batch_input_ids = batch.input_ids.cpu().tolist()
+            seq_lens_cpu = batch.seq_lens_cpu.tolist() if batch.seq_lens_cpu is not None else batch.seq_lens.cpu().tolist()
+            
+            # Try to get frame_num_per_video from multimodal inputs
+            frame_num_per_video_batch = []
+            if batch.multimodal_inputs:
+                for mm_input in batch.multimodal_inputs:
+                    if mm_input and hasattr(mm_input, 'frame_num_per_video'):
+                        frame_num_per_video_batch.append(getattr(mm_input, 'frame_num_per_video', []))
+                    else:
+                        frame_num_per_video_batch.append([])
+            else:
+                frame_num_per_video_batch = [[]] * len(seq_lens_cpu)
+            
+            start_idx = 0
+            for batch_idx, seq_len in enumerate(seq_lens_cpu):
+                # Extract input_ids for this request
+                input_ids = batch_input_ids[start_idx:start_idx + seq_len]
+                start_idx += seq_len
+                
+                # Get frame_num_per_video for this batch item
+                frame_num_per_video = frame_num_per_video_batch[batch_idx] if batch_idx < len(frame_num_per_video_batch) else []
+                
+                mask, converted_input_ids = self._get_cross_attention_token_mask(
+                    input_ids, image_token_id, video_token_id, frame_num_per_video
+                )
+                cross_attention_token_masks.append(np.array(mask))
+                
+                # Compute vision position ids
+                vision_position_ids = self._compute_vision_position_ids(
+                    converted_input_ids, image_token_id
+                )
+                vision_position_ids_batch.append(vision_position_ids)
+
+            # Get parameters from model config
+            model_config = model_runner.model_config
+            # Get vision_config from hf_config
+            vision_config = getattr(model_config.hf_config, 'vision_config', model_config.hf_config)
+            max_tiles_per_image = 1
+            
+            # Get number of vision tokens per patch/tile
+            image_size = getattr(vision_config, 'image_size', 
+                               getattr(model_config, 'image_size', 560))
+            patch_size = getattr(vision_config, 'patch_size', 
+                               getattr(model_config, 'patch_size', 14))
+            num_vision_tokens = (image_size // patch_size) ** 2 + 1
+            
+            # Check if there's a merge_size that affects the number of vision tokens
+            merge_size = getattr(vision_config, 'merge_size', 
+                               getattr(model_config, 'merge_size', None))
+            merge_mode = getattr(vision_config, 'merge_mode', 
+                               getattr(model_config, 'merge_mode', None))
+            if merge_mode is not None and merge_size is not None:
+                # If merging is applied, calculate the reduced number of tokens
+                height = width = image_size // patch_size
+                import math
+                if merge_mode in ["average", "max", "channelFusion"]:
+                    new_height = height // merge_size
+                    new_width = width // merge_size
+                elif merge_mode == "bilinear":
+                    new_height = math.ceil(height / merge_size)
+                    new_width = math.ceil(width / merge_size)
+                else:
+                    # Unknown merge mode, no pooling
+                    new_height = height
+                    new_width = width
+                num_vision_tokens = new_height * new_width + 1  # +1 for cls token
+            
+            num_tiles_batch = []
+            start_idx = 0
+            for seq_len in seq_lens_cpu:
+                # Count number of images in this request
+                input_ids = batch_input_ids[start_idx:start_idx + seq_len]
+                start_idx += seq_len
+                num_images = input_ids.count(image_token_id) if image_token_id else 0
+                num_tiles_batch.append([max_tiles_per_image] * num_images)
+
+            if not cross_attention_token_masks:
+                return None
+
+            # Process each sequence separately to avoid padding issues
+            custom_mask_parts = []
+            
+            for seq_idx, (sparse_mask, n_tiles, seq_len) in enumerate(zip(cross_attention_token_masks, num_tiles_batch, seq_lens_cpu)):
+                if len(n_tiles) == 0:  # No images in this sequence
+                    continue
+                    
+                # Create dense mask for this sequence only
+                max_num_images = len(n_tiles)
+                cross_attention_mask = np.zeros(
+                    shape=(1, seq_len, max_num_images, max_tiles_per_image),
+                    dtype=np.int64,
+                )
+                
+                # Fill the mask for this sequence
+                for image_idx, mask_n_tiles in enumerate(n_tiles):
+                    visible_token_indices = (sparse_mask >= image_idx) & (sparse_mask != -100)
+                    cross_attention_mask[0, visible_token_indices, image_idx, :mask_n_tiles] = 1
+
+                if cross_attention_mask.sum() > 0:
+                    # Convert to tensor and prepare mask
+                    cross_attention_mask = torch.from_numpy(cross_attention_mask).repeat_interleave(
+                        num_vision_tokens, dim=3
+                    )
+                    
+                    # Reshape to (1, seq_len, total_vision_tokens)
+                    cross_attention_mask = cross_attention_mask.view(1, seq_len, -1)
+                    
+                    # Convert to float and apply mask logic
+                    cross_attention_mask = cross_attention_mask.to(model_runner.dtype)
+                    inverted_cross_attn_mask = (1.0 - cross_attention_mask).to(model_runner.dtype)
+                    cross_attention_mask = inverted_cross_attn_mask.masked_fill(
+                        inverted_cross_attn_mask.to(torch.bool), torch.finfo(model_runner.dtype).min
+                    )
+                    
+                    # Move to device and convert to boolean mask
+                    cross_attention_mask = cross_attention_mask.to(model_runner.device)
+                    custom_mask = cross_attention_mask > -1e3  # True where we should attend
+                    
+                    # Flatten this sequence's mask: (seq_len, key_length) -> (seq_len * key_length,)
+                    custom_mask_parts.append(custom_mask.view(-1))
+            
+            # Process vision position ids
+            vision_position_ids_tensor = None
+            if vision_position_ids_batch and any(len(pos_ids) > 0 for pos_ids in vision_position_ids_batch):
+                # Concatenate all vision position ids
+                all_vision_pos_ids = []
+                for pos_ids in vision_position_ids_batch:
+                    if len(pos_ids) > 0:
+                        all_vision_pos_ids.extend(pos_ids)
+                if all_vision_pos_ids:
+                    vision_position_ids_tensor = torch.tensor(all_vision_pos_ids, dtype=torch.int64, device=model_runner.device)
+
+            if custom_mask_parts:
+                # Concatenate all sequences' flattened masks
+                # Final shape: (sum(q_len[i] * k_len[i] for i in range(batch_size)),)
+                return torch.cat(custom_mask_parts, dim=0), vision_position_ids_tensor
+            else:
+                return None, vision_position_ids_tensor
+            
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to compute custom cross attention mask: {e}")
+            return None, None
+
+    def _get_cross_attention_token_mask(self, input_ids, image_token_id, video_token_id, frame_num_per_video):
+        """
+        Generate a cross-attention-token-mask for each input_tokens in the input sequence.
+        """
+        import numpy as np
+        
+        # 1. Convert video tokens to image tokens
+        # input_ids_np = np.array(input_ids, dtype=np.int64)
+        # if video_token_id in input_ids_np:
+        #     total_vid_num = np.sum(input_ids_np == video_token_id)
+        #     f_num_per_vid = frame_num_per_video[:total_vid_num]
+
+        #     convert_input_ids_list = []
+        #     vid_idx = 0
+        #     for token_id in input_ids_np:
+        #         if token_id == video_token_id:
+        #             vid_len = f_num_per_vid[vid_idx]
+        #             vid_idx += 1
+        #             convert_input_ids_list.extend([image_token_id] * vid_len)
+        #         else:
+        #             convert_input_ids_list.append(token_id)
+        #     convert_input_ids = np.array(convert_input_ids_list, dtype=np.int64)
+        # else:
+        #     convert_input_ids = input_ids_np
+
+        convert_input_ids = np.array(input_ids, dtype=np.int64)
+
+        # 2. Generate the sparse attention mask based on causal visibility
+        is_image = convert_input_ids == image_token_id
+        image_count_cumulative = np.cumsum(is_image)
+        image_count_before = np.pad(image_count_cumulative[:-1], (1, 0), "constant", constant_values=0)
+        num_images_seen = np.where(is_image, image_count_cumulative, image_count_before)
+
+        vision_masks = np.full(len(convert_input_ids), -100, dtype=np.int64)
+        valid_mask = num_images_seen > 0
+        vision_masks[valid_mask] = num_images_seen[valid_mask] - 1
+
+        return vision_masks.tolist(), convert_input_ids.tolist()
+
+    def _compute_vision_position_ids(self, input_ids, image_token_id):
+        """
+        Compute vision position ids for image tokens in the sequence.
+        This follows the VideoMllama implementation.
+        
+        Note: vision_position_ids only tracks the position of <image> tokens in the input sequence,
+        not individual vision patches. It has shape (1, num_image_tokens) and is not affected by pooling.
+        """
+        import numpy as np
+        
+        # Find positions of image tokens
+        input_ids_arr = np.array(input_ids, dtype=np.int64)
+        image_mask = input_ids_arr == image_token_id
+        
+        # Get positions where image tokens appear
+        if np.any(image_mask):
+            # Compute cumulative position ids
+            cumulative_positions = np.cumsum(np.ones_like(input_ids_arr), dtype=np.int64) - 1
+            # Extract positions of image tokens
+            vision_position_ids = cumulative_positions[image_mask]
+            return vision_position_ids.tolist()
+        else:
+            return []
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """

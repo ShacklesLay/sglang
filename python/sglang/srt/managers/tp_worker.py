@@ -200,7 +200,7 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner, self.tokenizer)
 
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:

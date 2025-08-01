@@ -198,6 +198,7 @@ class ServerArgs:
     disable_overlap_schedule: bool = False
     disable_overlap_cg_plan: bool = False
     enable_mixed_chunk: bool = False
+    enable_custom_cross_attention: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
@@ -1432,6 +1433,11 @@ class ServerArgs:
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
+        )
+        parser.add_argument(
+            "--enable-custom-cross-attention",
+            action="store_true",
+            help="Enable custom cross attention mask computation for models with special attention patterns (e.g., video-mllama).",
         )
         parser.add_argument(
             "--enable-dp-attention",

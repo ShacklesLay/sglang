@@ -237,6 +237,9 @@ class MultimodalDataItem:
     input_features: Optional[torch.Tensor] = None
     input_features_mask: Optional[torch.Tensor] = None
 
+    # For video data
+    pixel_values_videos: Union[torch.Tensor, np.ndarray] = None
+
     @staticmethod
     def is_empty_list(l):
         if l is None:
@@ -258,7 +261,10 @@ class MultimodalDataItem:
                 elif self.input_features is not None:
                     self.hash = hash_feature(self.input_features)
             elif self.is_video():
-                self.hash = hash_feature(self.pixel_values_videos)
+                if self.pixel_values is not None:
+                    self.hash = hash_feature(self.pixel_values)
+                elif self.pixel_values_videos is not None:
+                    self.hash = hash_feature(self.pixel_values_videos)
             else:
                 self.hash = hash_feature(self.pixel_values)
 
@@ -286,6 +292,7 @@ class MultimodalDataItem:
     def is_video(self):
         return (self.modality == Modality.VIDEO) and (
             self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
             or not MultimodalDataItem.is_empty_list(self.pixel_values_videos)
         )
 
@@ -341,6 +348,9 @@ class MultimodalInputs:
     # QWen2-VL related
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    
+    # Video MLlama related - frame counts per video
+    frame_num_per_video: Optional[List[int]] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -366,6 +376,7 @@ class MultimodalInputs:
             "audio_start_id",
             "audio_end_id",
             "audio_token_id",
+            "frame_num_per_video",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -394,6 +405,7 @@ class MultimodalInputs:
         optional_args = [
             "mm_items",
             "image_pad_len",
+            "frame_num_per_video",
         ]
         for arg in optional_args:
             self_arg = getattr(self, arg, None)

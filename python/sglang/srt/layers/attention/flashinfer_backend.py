@@ -256,6 +256,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
+                custom_mask=forward_batch.custom_mask,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged, use_ragged, extend_no_prefix
@@ -786,6 +787,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        custom_mask: Optional[torch.Tensor],
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -800,6 +802,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        custom_mask: Optional[torch.Tensor],
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -833,6 +836,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        custom_mask: Optional[torch.Tensor],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -874,6 +878,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        custom_mask: Optional[torch.Tensor],
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -881,11 +886,13 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens = seq_lens
                 kv_start_idx = encoder_lens
                 paged_kernel_lens_sum = seq_lens_sum
+                current_custom_mask = None
             else:
                 # cross attention
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                current_custom_mask = custom_mask
 
             self.call_begin_forward(
                 self.prefill_wrapper_ragged,
@@ -900,6 +907,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
+                current_custom_mask,
             )
 
     def call_begin_forward(
@@ -916,6 +924,7 @@ class FlashInferIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        custom_mask: Optional[torch.Tensor]=None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -939,7 +948,6 @@ class FlashInferIndicesUpdaterPrefill:
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            custom_mask = None
         else:
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
                 spec_info, EagleVerifyInput

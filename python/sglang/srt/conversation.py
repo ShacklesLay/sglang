@@ -770,6 +770,20 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="video_mllama",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA3,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot_id|>"],
+        image_token="<|image|>",
+        video_token="<|video|>"
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="llama_3_vision",
         system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
         system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
@@ -1087,3 +1101,9 @@ def match_vila(model_path: str):
 def match_mimo_vl(model_path: str):
     if re.search(r"mimo.*vl", model_path, re.IGNORECASE):
         return "mimo-vl"
+
+
+@register_conv_template_matching_function
+def match_streaming_video_model(model_path: str):
+    if re.search(r"video_mllama", model_path, re.IGNORECASE):
+        return "video_mllama"
