@@ -605,7 +605,7 @@ def generate_chat_conv(
                         conv.modalities.append(content.modalities)
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name != "qwen2-vl"
+                    if conv.name != "qwen2-vl" and conv.name != "video_mllama"
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
