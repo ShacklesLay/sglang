@@ -351,6 +351,10 @@ class MultimodalInputs:
     
     # Video MLlama related - frame counts per video
     frame_num_per_video: Optional[List[int]] = None
+    
+    # VideoMllama custom cross attention
+    cross_attention_mask: Optional[torch.Tensor] = None
+    vision_position_ids: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -377,6 +381,8 @@ class MultimodalInputs:
             "audio_end_id",
             "audio_token_id",
             "frame_num_per_video",
+            "cross_attention_mask",
+            "vision_position_ids",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -429,6 +435,14 @@ class MultimodalInputs:
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
+        
+        # Raise error when handling cross_attention_mask
+        if self.cross_attention_mask is not None or other.cross_attention_mask is not None:
+            raise ValueError("cross_attention_mask is not supported when merging multimodal inputs")
+        
+        # Raise error when handling vision_position_ids
+        if self.vision_position_ids is not None or other.vision_position_ids is not None:
+            raise ValueError("vision_position_ids is not supported when merging multimodal inputs")
 
         for key, val in other.__dict__.items():
             if "_id" in key:
