@@ -1038,8 +1038,6 @@ class Scheduler(
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
-            if recv_req.mm_inputs is not None:
-                import debugpy; debugpy.connect(('localhost', 9998))
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None or not self.running_batch.is_empty()
